@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CastFlow Receiver</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #05060d; color: #eef0ff; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  body::before { content: ""; position: fixed; inset: 0; background: radial-gradient(60% 50% at 50% 0%, rgba(124,58,237,.35), transparent 70%), radial-gradient(40% 40% at 100% 100%, rgba(79,70,229,.25), transparent 70%); }
+  #idle { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2vh; text-align: center; padding: 4vw; }
+  h1 { margin: 0; font-size: 4vw; letter-spacing: .02em; } h1 b { color: #a78bfa; }
+  .code { font-size: 9vw; font-weight: 700; letter-spacing: .35em; padding: 2vh 3vw 2vh 4vw; border-radius: 2vw; background: rgba(255,255,255,.05); border: 1px solid rgba(167,139,250,.5); box-shadow: 0 0 6vw rgba(124,58,237,.35); font-variant-numeric: tabular-nums; }
+  .sub { font-size: 1.8vw; opacity: .75; max-width: 60vw; line-height: 1.5; }
+  .pill { display: inline-flex; align-items: center; gap: .6vw; font-size: 1.5vw; padding: .8vh 1.4vw; border-radius: 99px; background: rgba(255,255,255,.06); }
+  .dot { width: .9vw; height: .9vw; border-radius: 50%; background: #f59e0b; } .dot.ok { background: #22c55e; box-shadow: 0 0 1vw #22c55e; }
+  #v { position: fixed; inset: 0; width: 100%; height: 100%; background: #000; display: none; object-fit: contain; }
+  #msg { position: fixed; left: 50%; bottom: 6vh; transform: translateX(-50%); padding: 1.2vh 2vw; border-radius: 1vw; background: rgba(0,0,0,.75); font-size: 1.8vw; display: none; max-width: 80vw; text-align: center; }
+  #tap { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.6); }
+  #tap button { font-size: 3vw; padding: 2vh 4vw; border: 0; border-radius: 2vw; background: linear-gradient(135deg,#8b5cf6,#6d28d9); color: #fff; }
+  @media (max-width: 700px) { h1 { font-size: 8vw } .code { font-size: 16vw } .sub, .pill { font-size: 4vw } .dot { width: 2vw; height: 2vw } }
+</style>
+</head>
+<body>
+<div id="idle">
+  <h1>Cast<b>Flow</b> Receiver</h1>
+  <div id="codeBox" class="code">······</div>
+  <div class="sub" id="help">Open CastFlow on your laptop or phone, choose <b>Enter Code</b> and type this number.</div>
+  <div class="pill"><span class="dot" id="dot"></span><span id="state">Connecting to CastFlow…</span></div>
+</div>
+<video id="v" playsinline></video>
+<div id="msg"></div>
+<div id="tap"><button id="tapBtn" autofocus>Press OK to start playback</button></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const v = $('v');
+  const store = (k, val) => { try { if (val === undefined) return localStorage.getItem(k); localStorage.setItem(k, val); } catch (e) { return null; } };
+  let id = store('cf.id'); if (!id) { id = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now()); store('cf.id', id); }
+  const name = (store('cf.name') || (/Android|Google TV|SmartTV|Tizen|Web0S|webOS|Roku|AFT/i.test(navigator.userAgent) ? 'Living Room TV' : 'TV browser (' + (navigator.platform || 'device') + ')'));
+
+  const caps = () => {
+    const c = (t) => !!v.canPlayType(t);
+    return { mp4: c('video/mp4; codecs="avc1.640028,mp4a.40.2"'), webm: c('video/webm; codecs="vp9,opus"'), mkv: c('video/x-matroska'), hevc: c('video/mp4; codecs="hvc1.1.6.L153.B0"') };
+  };
+
+  let ws, retry = 0, paired = false, offset = 0, transcoding = false, lastErr = null, pending = null;
+
+  function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+  function showIdle(on) { $('idle').style.display = on ? 'flex' : 'none'; v.style.display = on ? 'none' : 'block'; }
+  function msg(t, ms) { const m = $('msg'); if (!t) { m.style.display = 'none'; return; } m.textContent = t; m.style.display = 'block'; if (ms) setTimeout(() => { if (m.textContent === t) m.style.display = 'none'; }, ms); }
+
+  function report(state) {
+    const dur = (!transcoding && isFinite(v.duration)) ? v.duration : undefined;
+    send({ type: 'status', state, position: v.currentTime || 0, duration: dur, volume: Math.round(v.volume * 100), error: lastErr || undefined });
+  }
+  function stateNow() {
+    if (lastErr) return 'error';
+    if (!v.getAttribute('src')) return 'idle';
+    if (v.ended) return 'stopped';
+    if (v.paused) return v.readyState < 2 && !v.currentTime ? 'loading' : 'paused';
+    return v.readyState >= 3 ? 'playing' : 'loading';
+  }
+
+  function connect() {
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/receiver');
+    ws.onopen = () => { retry = 0; send({ type: 'hello', id, name, token: store('cf.token') || undefined, caps: caps() }); $('state').textContent = 'Waiting for pairing…'; };
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.type === 'code') { paired = false; $('codeBox').textContent = m.code; $('dot').className = 'dot'; $('state').textContent = 'Waiting for pairing…'; $('help').style.display = ''; showIdle(true); }
+      else if (m.type === 'paired') { paired = true; if (m.token) store('cf.token', m.token); $('codeBox').textContent = '✓'; $('dot').className = 'dot ok'; $('state').textContent = 'Connected to CastFlow'; $('help').style.display = 'none'; }
+      else if (m.type === 'unpaired') { store('cf.token', ''); paired = false; stop(); }
+      else if (m.type === 'play') play(m);
+      else if (m.type === 'pause') v.pause();
+      else if (m.type === 'resume') v.play().catch(onPlayErr);
+      else if (m.type === 'seek') { if (transcoding) return; v.currentTime = m.sec; }
+      else if (m.type === 'volume') v.volume = Math.max(0, Math.min(1, m.value));
+      else if (m.type === 'stop') stop();
+      else if (m.type && m.type.indexOf('rtc:') === 0) rtc(m);
+    };
+    ws.onclose = () => { $('dot').className = 'dot'; $('state').textContent = 'Reconnecting…'; setTimeout(connect, Math.min(8000, 800 * ++retry)); };
+    ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  }
+
+  function onPlayErr(err) {
+    if (err && err.name === 'NotAllowedError') { $('tap').style.display = 'flex'; $('tapBtn').focus(); pending = () => v.play().catch(onPlayErr); return; }
+    lastErr = 'Playback error: ' + (err && err.message || 'unknown'); report('error');
+  }
+
+  function play(m) {
+    lastErr = null; transcoding = !!m.transcoding; offset = 0;
+    [...v.querySelectorAll('track')].forEach((t) => t.remove());
+    v.src = m.url;
+    if (m.subtitleUrl) { const t = document.createElement('track'); t.kind = 'subtitles'; t.src = m.subtitleUrl; t.default = true; t.label = 'Subtitles'; v.appendChild(t); }
+    showIdle(false); msg('');
+    const startAt = transcoding ? 0 : (m.startSec || 0);
+    const go = () => { if (startAt) { try { v.currentTime = startAt; } catch (e) {} } v.play().catch(onPlayErr); };
+    v.addEventListener('loadedmetadata', go, { once: true });
+    v.load();
+  }
+  let pc = null;
+  async function rtc(m) {
+    try {
+      if (m.type === 'rtc:offer') {
+        if (pc) pc.close();
+        pc = new RTCPeerConnection({ iceServers: [] });
+        pc.onicecandidate = (e) => { if (e.candidate) send({ type: 'rtc:ice', candidate: e.candidate }); };
+        pc.ontrack = (e) => { v.srcObject = e.streams[0]; transcoding = true; showIdle(false); v.play().catch(onPlayErr); };
+        pc.onconnectionstatechange = () => {
+          send({ type: 'rtc:state', state: pc.connectionState });
+          if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') { v.srcObject = null; showIdle(true); }
+        };
+        await pc.setRemoteDescription(m.sdp);
+        const ans = await pc.createAnswer(); await pc.setLocalDescription(ans);
+        send({ type: 'rtc:answer', sdp: pc.localDescription });
+      } else if (m.type === 'rtc:ice' && pc) await pc.addIceCandidate(m.candidate);
+      else if (m.type === 'rtc:stop') { if (pc) pc.close(); pc = null; v.srcObject = null; showIdle(true); }
+    } catch (err) { send({ type: 'rtc:state', state: 'failed', error: String(err && err.message || err) }); }
+  }
+  function stop() { v.pause(); v.removeAttribute('src'); v.load(); lastErr = null; showIdle(true); report('stopped'); }
+
+  v.addEventListener('error', () => { const e = v.error; lastErr = 'This TV cannot play this stream (' + (e ? ['', 'aborted', 'network', 'decode', 'unsupported'][e.code] || e.code : 'error') + '). Turn on transcoding in CastFlow settings.'; msg(lastErr); report('error'); });
+  ['playing', 'pause', 'waiting', 'ended', 'seeked', 'canplay'].forEach((ev) => v.addEventListener(ev, () => { if (ev === 'playing') { lastErr = null; msg(''); } report(stateNow()); }));
+  setInterval(() => { if (paired) report(stateNow()); else send({ type: 'ping' }); }, 1000);
+
+  $('tapBtn').onclick = () => { $('tap').style.display = 'none'; if (pending) pending(); pending = null; };
+  document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && $('tap').style.display === 'flex') $('tapBtn').click(); });
+  connect();
+})();
+</script>
+</body>
+</html>
